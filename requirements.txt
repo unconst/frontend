@@ -6,3 +6,5 @@ transformers
 python-dotenv
 datasets
 torchvision
+wandb
+typer
