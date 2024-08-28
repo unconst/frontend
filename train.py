@@ -56,13 +56,28 @@ def main(model_name: str = 'gpt2',
         num_pages=num_pages, 
         save_interval=save_interval, 
         look_ahead=look_ahead,
-        optimizer_lr=optimizer_lr,
         optimizer_beta1=optimizer_beta1,
         optimizer_beta2=optimizer_beta2,
         optimizer_weight_decay=optimizer_weight_decay,
         baseline=baseline,
         use_wandb=use_wandb
     )
+    # Print the args to screen in a nicely formatted manner
+    print("Training Configuration:")
+    print(f"Project Name: {args.project_name}")
+    print(f"Model Name: {args.model_name}")
+    print(f"Batch Size: {args.batch_size}")
+    print(f"Sequence Length: {args.sequence_length}")
+    print(f"Learning Rate: {args.learning_rate}")
+    print(f"Device: {args.device}")
+    print(f"Number of Pages: {args.num_pages}")
+    print(f"Save Interval: {args.save_interval}")
+    print(f"Look Ahead: {args.look_ahead}")
+    print(f"Optimizer Beta1: {args.optimizer_beta1}")
+    print(f"Optimizer Beta2: {args.optimizer_beta2}")
+    print(f"Optimizer Weight Decay: {args.optimizer_weight_decay}")
+    print(f"Baseline: {args.baseline}")
+    print(f"Use WandB: {args.use_wandb}")
 
     # Load the tokenizer
     batch_size = args.batch_size
@@ -71,7 +86,7 @@ def main(model_name: str = 'gpt2',
     tokenizer.pad_token = tokenizer.eos_token
 
     # Create a GPT2 model from scratch.
-    configuration = GPT2Config(output_hidden_states=False)
+    configuration = GPT2Config(output_hidden_states=False, n_positions=sequence_length)
     model = GPT2LMHeadModel(config=configuration)
     # model.load_state_dict(torch.load('/home/setup/reduct/fineweb_model.pt'))
 
@@ -82,7 +97,7 @@ def main(model_name: str = 'gpt2',
     # AdamW optimizer with specified parameters
     optimizer = optim.AdamW(
         model.parameters(),
-        lr=args.optimizer_lr,  # Peak learning rate
+        lr=args.learning_rate,  # Peak learning rate
         betas=(args.optimizer_beta1, args.optimizer_beta2), # B1 and B2
         weight_decay=args.optimizer_weight_decay  # Weight decay
     )
@@ -192,36 +207,42 @@ def main(model_name: str = 'gpt2',
 
     # Initialize wandb if use_wandb is True
     if args.use_wandb:
-        wandb.init(project=args.project_name, config={
-            "batch_size": args.batch_size,
-            "sequence_length": args.sequence_length,
-            "learning_rate": args.learning_rate,
-            "device": args.device,
-            "model_name": args.model_name
-        })
-
+        wandb.init(project=args.project_name, config=vars(args))
+        
     model.train()
     while True:
-        dataset = SubsetFineWebEdu2Loader(batch_size=batch_size, sequence_length=sequence_length, num_pages=args.num_pages, tokenizer=tokenizer)
-        for idx, batch in enumerate(dataset):
-            loss, realized_bandwidth, base_line_bandwidth = train_step_with_avg_grad(batch)
-            print(f"Loss: {loss.item()}, reduction_x: {base_line_bandwidth/realized_bandwidth}, perplexity: {math.exp(loss.item())}")
-            
-            # Log metrics to wandb if use_wandb is True
-            if args.use_wandb:
-                wandb.log({
-                    "Loss": loss.item(),
-                    "Reduction_x": base_line_bandwidth/realized_bandwidth,
-                    "Perplexity": math.exp(loss.item())
-                })
-            
-            # Save the model to the local directory every save_interval steps
-            if idx % args.save_interval == 0:
-                model_save_path = f"./fineweb_model.pt"
-                torch.save(model.state_dict(), model_save_path)
-                print('saved new model.')
+        try:
+            dataset = SubsetFineWebEdu2Loader(batch_size=batch_size, sequence_length=sequence_length, num_pages=args.num_pages, tokenizer=tokenizer)
+            for idx, batch in enumerate(dataset):
+                loss, realized_bandwidth, base_line_bandwidth = train_step_with_avg_grad(batch)
+                print(f"Loss: {loss.item()}, reduction_x: {base_line_bandwidth/realized_bandwidth}, perplexity: {math.exp(loss.item())}")
+                
+                # Log metrics to wandb if use_wandb is True
                 if args.use_wandb:
-                    wandb.save(model_save_path)
+                    wandb.log({
+                        "Loss": loss.item(),
+                        "Reduction_x": base_line_bandwidth/realized_bandwidth,
+                        "Perplexity": math.exp(loss.item())
+                    })
+                
+                # Save the model to the local directory every save_interval steps
+                if idx % args.save_interval == 0:
+                    model_save_path = f"./fineweb_model.pt"
+                    torch.save(model.state_dict(), model_save_path)
+                    print('saved new model.')
+                    if args.use_wandb:
+                        wandb.save(model_save_path)
+                            
+        except Exception as e:
+            import traceback
+            print(f"An error occurred during training step: {e}. Continuing training...")
+            traceback.print_exc()
+                    
+        except KeyboardInterrupt:
+            print("Training interrupted. Finishing wandb run.")
+            if args.use_wandb:
+                wandb.finish()
+            break
 
 if __name__ == "__main__":
     typer.run(main)
