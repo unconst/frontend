@@ -10,13 +10,11 @@ from transformers import AutoTokenizer
 from dataset import SubsetFineWebEdu2Loader
 from transformers import GPT2Config, GPT2LMHeadModel, AdamW
 
-AVAILABLE_METHODS = ['baseline', 'seqcompress', 'batchcompress', 'topk', 'rank']
-
 # Argument parser for hyperparameters
 def main(model_name: str = 'gpt2', 
     run_name: str = None,
     project_name: str = 'fineweb-tuning',
-    method: str = 'seqcompress',
+    method: str = 'baseline',
     batch_size: int = 12, 
     sequence_length: int = 2048, 
     learning_rate: float = 5e-7, 
@@ -28,7 +26,9 @@ def main(model_name: str = 'gpt2',
     optimizer_beta2: float = 0.95, 
     optimizer_weight_decay: float = 0.1,
     use_wandb: bool = False,
-    use_batch_norm: bool = False
+    moving: bool = True,
+    compression: int = 100,
+    alpha: float = 0.1
 ):
     """
     Main function to train the GPT-2 model with specified hyperparameters.
@@ -49,7 +49,6 @@ def main(model_name: str = 'gpt2',
         optimizer_weight_decay (float): Weight decay for the AdamW optimizer.
         method: (str): baseline, seqcompress, batchcompress
         use_wandb (bool): Whether to use wandb for logging.
-        use_batch_norm (bool): use batch normalization at grad level.
     """
     args = SimpleNamespace(
         run_name = run_name,
@@ -66,14 +65,13 @@ def main(model_name: str = 'gpt2',
         optimizer_weight_decay=optimizer_weight_decay,
         method=method,
         use_wandb=use_wandb,
-        use_batch_norm = use_batch_norm,
+        moving = moving,
+        compression = compression,
+        alpha = alpha,
     )
     # Print the args to screen in a nicely formatted manner
     if args.use_wandb and args.run_name == None:
         print("Error: You need to set a unique run name i.e. --run-name baseline-1")
-        sys.exit()
-    if args.method not in AVAILABLE_METHODS:
-        print(f"Error: You need to set a method in {AVAILABLE_METHODS}")
         sys.exit()
 
     print("Training Configuration:")
@@ -115,37 +113,8 @@ def main(model_name: str = 'gpt2',
         weight_decay=args.optimizer_weight_decay  # Weight decay
     )
 
-    inputs_dict = {}
-    grad_inputs_dict = {}
-    
-    def save_layer_inputs(layer):
-        """
-        Hook to save the inputs of a layer during the forward pass.
-        """
-        def hook(module, input, output):
-            if isinstance(input, tuple):
-                if len(input) > 0:
-                    inputs_dict[layer] = input[0].detach().clone()
-            else:
-                if input is not None:
-                    inputs_dict[layer] = input.detach().clone()
-        return hook
-    
-    def save_layer_grads(layer):
-        """
-        Hook to save the gradients of a layer during the backward pass.
-        """
-        def hook(module, grad_input, grad_output):
-            grad_inputs_dict[layer] = grad_output[0].detach().clone()
-        return hook
-    
-    # Register hooks for all layers that require gradients
-    for name, layer in model.named_modules():
-        if any(p.requires_grad for p in layer.parameters()):
-            layer.register_forward_hook(save_layer_inputs(layer))
-            layer.register_full_backward_hook(save_layer_grads(layer))
-            
-
+    # Dictionary to maintain a moving average of the true gradients
+    previous_gradients = {}
 
     def train_step_with_avg_grad(batch):
         """
@@ -165,54 +134,72 @@ def main(model_name: str = 'gpt2',
 
         # Backward pass
         loss.backward()
-        
-        if args.method == 'baseline':  
-            all_realized_bandwidth = sum(param.grad.element_size() * param.grad.nelement() for param in model.parameters() if param.grad is not None)
-            base_line_bandwidth = sum(param.grad.element_size() * param.grad.nelement() for param in model.parameters() if param.grad is not None)
-        else:  
-            optimizer.zero_grad()
-            all_realized_bandwidth = 0
-            base_line_bandwidth = 0
-            for layer in list(grad_inputs_dict.keys()):
+             
+        all_realized_bandwidth = 0
+        base_line_bandwidth = 0
+        for name, layer in model.named_modules():
+            for i, param in enumerate(layer.parameters()):
                 
-                inputs = inputs_dict[layer].to(device)
-                grad_outputs = grad_inputs_dict[layer].to(device)
+                moving = args.moving
+                compression = args.compression
+                # if moving == True: 
+                    
+                # Update moving average of the true gradient
+                alpha = args.alpha
+                prev_grad = param.grad.clone()
+                if param in previous_gradients:
+                    grad_variance = ((prev_grad - previous_gradients[param]) ** 2).view(-1)
+                    grad_variance_normalized = torch.softmax(grad_variance, dim=0)
+                    grad_entropy = grad_variance_normalized * torch.log(grad_variance_normalized + 1e-12)
+                    grad_entropy_normalized = grad_entropy / grad_entropy.sum()
+                    grad_absolute_normalized = prev_grad.abs().view(-1) / prev_grad.sum() 
 
-                # Check if the inputs can require gradients
-                if inputs.requires_grad is False:
-                    try:
-                        inputs.requires_grad_(True)
-                    except Exception as e:
-                        pass
-                layer_output = layer(inputs)[0]
-                if isinstance(layer_output, tuple):
-                    layer_output = layer_output[0]
+                    if args.method == 'entva': 
+                        gradient_score = grad_entropy_normalized + grad_variance_normalized  + grad_absolute_normalized
+                    
+                    # elif args.method == 'entv':
+                    #     gradient_score = grad_entropy_normalized + grad_variance_normalized
+                    
+                    elif args.method == 'enta':
+                        gradient_score = grad_entropy_normalized + grad_absolute_normalized
+
+                    elif args.method == 'av':
+                        gradient_score = grad_absolute_normalized + grad_variance_normalized
+
+                    # elif args.method == 'v':
+                    #     gradient_score = grad_variance_normalized
+                        
+                    elif args.method == 'a':
+                        gradient_score = grad_absolute_normalized
+                    
+                    # elif args.method == 'ent':
+                    #     gradient_score = grad_entropy_normalized
+                        
+                    elif args.method == 'absa':
+                        gradient_score = prev_grad.abs().view(-1) 
+
+                    elif args.method == 'absav':
+                        gradient_score = prev_grad.abs().view(-1) + grad_variance
+
+                    elif args.method == 'absavent':
+                        gradient_score = prev_grad.abs().view(-1) + grad_variance + grad_entropy
+
+                    previous_gradients[param] = prev_grad
                 else:
-                    layer_output = layer_output
-
-                prev_size = grad_outputs.nelement()
+                    gradient_score = prev_grad
+                    previous_gradients[param] = prev_grad
+                    
                 
-                if args.use_batch_norm:
-                    scaling_factor =  1 / (args.batch_size * args.sequence_length)
-                    avg_layer_output = layer_output.view(-1, layer_output.shape[-1]).sum(dim=0, keepdim=True)
-                    avg_grad_outputs = grad_outputs.view(-1, grad_outputs.shape[-1]).sum(dim=0, keepdim=True)
+                if param.grad.nelement() > compression * 4:
+                    topk_values, topk_indices = torch.topk( gradient_score.view(-1), k=int(max(1, gradient_score.nelement() * (1/compression))) )
+                    base_line_bandwidth += param.grad.element_size() * param.grad.nelement()
+                    param.grad.zero_()
+                    gathered_values = prev_grad.view(-1).gather(0, topk_indices)
+                    param.grad.view(-1).scatter_(0, topk_indices, gathered_values)
+                    all_realized_bandwidth += topk_indices.element_size() * topk_indices.nelement() + topk_values.element_size() * topk_values.nelement()
                 else:
-                    scaling_factor = (args.batch_size * args.sequence_length)
-                    avg_layer_output = layer_output.view(-1, layer_output.shape[-1]).mean(dim=0, keepdim=True)
-                    avg_grad_outputs = grad_outputs.view(-1, grad_outputs.shape[-1]).mean(dim=0, keepdim=True)
-                
-                post_size = avg_grad_outputs.nelement()
-                
-                all_realized_bandwidth += avg_layer_output.element_size() * avg_layer_output.nelement() + avg_grad_outputs.element_size() * avg_grad_outputs.nelement()
-
-                # Recompute gradient w.r.t the layer using averaged values
-                grad_wrt_layer_recomputed = torch.autograd.grad(outputs=avg_layer_output, inputs=layer.parameters(), grad_outputs=avg_grad_outputs, retain_graph=False)
-                for grad in grad_wrt_layer_recomputed:
-                    base_line_bandwidth += grad.element_size() * grad.nelement()
-
-                # Scale the gradient to approximate the sum of gradients
-                for i, param in enumerate(layer.parameters()):
-                    param.grad = grad_wrt_layer_recomputed[i] * scaling_factor
+                    base_line_bandwidth += param.grad.element_size() * param.grad.nelement()
+                    all_realized_bandwidth += param.grad.element_size() * param.grad.nelement()            
                     
         # Apply the gradients.
         optimizer.step()
@@ -223,56 +210,6 @@ def main(model_name: str = 'gpt2',
     # Initialize wandb if use_wandb is True
     if args.use_wandb:
         wandb.init(project=args.project_name, name = args.run_name, config=vars(args))
-        
-        
-    # def logit_saving(batch):
-    #      # Shift the input ids and create labels
-    #     input_ids = torch.tensor(batch, dtype=torch.long).to(device)
-    #     labels = input_ids.clone()
-    #     labels[:, :-1] = input_ids[:, 1:]
-    #     labels[:, -1] = tokenizer.pad_token_id
-
-    #     # Forward pass
-    #     outputs = model(input_ids=input_ids, labels=labels)
-    #     loss = outputs.loss
-
-    #     # Retain gradients w.r.t to the logits
-    #     logits = outputs.logits
-    #     logits.retain_grad()
-
-    #     # Backward pass
-    #     loss.backward()
-        
-    #     # get the gradients from the logits.
-    #     logits_grads = logits.grad.clone()
-        
-    #     # Zero the grads.
-    #     optimizer.zero_grad()
-
-    #     # Free the graph and grads before this
-    #     del logits.grad
-    #     torch.cuda.empty_cache()
-
-    #     # Do the full backward using the logits grads and the inputs
-    #     # Perform the full backward pass using the logits gradients and the inputs
-    #     final_layer_recreated = model(input_ids=input_ids, labels=labels).logits
-    #     avg_grad_final_layer = logits_grads.mean(dim=0) * args.batch_size
-    #     final_layer_recreated_compressed = final_layer_recreated.mean(dim=0)
-
-    #     # Backward pass using the retained gradients
-    #     final_layer_recreated_compressed.backward(gradient=avg_grad_final_layer)
-        
-    #     # Apply the step.
-    #     optimizer.step()
-        
-    #     # compute the bandwidth wins.
-    #     all_realized_bandwidth = avg_grad_final_layer.element_size() * avg_grad_final_layer.nelement() 
-    #     base_line_bandwidth = sum(param.grad.element_size() * param.grad.nelement() for param in model.parameters() if param.grad is not None)
-
-    #     # Zero grads.
-    #     optimizer.zero_grad()
-    #     return loss, all_realized_bandwidth, base_line_bandwidth
-
 
     model.train()
     while True:
@@ -280,9 +217,7 @@ def main(model_name: str = 'gpt2',
             dataset = SubsetFineWebEdu2Loader(batch_size=batch_size, sequence_length=sequence_length, num_pages=args.num_pages, tokenizer=tokenizer)
             for idx, batch in enumerate(dataset):
                 loss, realized_bandwidth, base_line_bandwidth = train_step_with_avg_grad(batch)
-                # loss, realized_bandwidth, base_line_bandwidth = logit_saving( batch )
                 print(f"{args.method} - {args.run_name} - Loss: {loss.item()}, reduction_x: {base_line_bandwidth/realized_bandwidth}, perplexity: {math.exp(loss.item())}")
-                
                 # Log metrics to wandb if use_wandb is True
                 if args.use_wandb:
                     wandb.log({

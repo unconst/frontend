@@ -11,6 +11,8 @@ wandb/
 # Model files
 *.pt
 
+# test files 
+*.ipynb
 
 # Distribution / packaging
 .Python
